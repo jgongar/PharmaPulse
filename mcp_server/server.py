@@ -17,7 +17,7 @@ API_BASE = "http://localhost:8000"
 
 mcp = FastMCP(
     "PharmaPulse",
-    description="Pharma R&D Portfolio NPV Platform — query assets, run NPV, and analyze portfolios",
+    instructions="Pharma R&D Portfolio NPV Platform — query assets, run NPV, and analyze portfolios",
 )
 
 
