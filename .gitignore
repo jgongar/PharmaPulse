@@ -18,6 +18,8 @@ env/
 
 # Machine-specific config
 claude_desktop_config.json
+start.bat
+start.ps1
 
 # IDE
 .vscode/

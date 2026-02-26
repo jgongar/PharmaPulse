@@ -162,21 +162,7 @@ python -m backend.seed_data
 
 Creates `backend/pharmapulse.db` with 10 sample pharma assets and computes base-case NPV for all internal assets.
 
-### Start (Windows)
-
-```bat
-start.bat
-```
-
-Or with PowerShell:
-
-```powershell
-.\start.ps1
-```
-
-Both scripts start the backend and frontend in separate windows.
-
-### Start (manual)
+### Start
 
 ```bash
 # Terminal 1 — backend
@@ -250,9 +236,7 @@ pharmapulse/
 │   ├── server.py                 # FastMCP tool server
 │   └── system_prompt.py         # Claude Desktop system prompt
 ├── tests/                        # Pytest suite
-├── requirements.txt
-├── start.bat
-└── start.ps1
+└── requirements.txt
 ```
 
 ---
