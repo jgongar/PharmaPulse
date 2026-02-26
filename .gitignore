@@ -13,6 +13,11 @@ env/
 
 # Database (generated — re-create with seed_data.py)
 *.db
+*.db-shm
+*.db-wal
+
+# Machine-specific config
+claude_desktop_config.json
 
 # IDE
 .vscode/

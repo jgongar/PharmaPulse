@@ -1,0 +1,2 @@
+# PharmaPulse Frontend Pages
+

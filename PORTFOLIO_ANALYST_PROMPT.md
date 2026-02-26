@@ -1,6 +1,9 @@
-# PharmaPulse Portfolio Analyst — System Prompt
+# PharmaPulse v6 — MCP / Chat System Prompt
 
-Use this as the system prompt (or paste into a Claude Desktop project) to get an AI portfolio analyst that calls PharmaPulse MCP tools.
+This is the system prompt used by the PharmaPulse AI chat panel and the MCP server integration
+for Claude Desktop. It configures Claude as a senior pharma R&D portfolio analyst with access
+to all PharmaPulse tools. Paste it into a Claude Desktop project, or set it as the system
+prompt when calling the Anthropic API directly.
 
 ---
 

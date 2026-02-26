@@ -1,23 +1,32 @@
-# Top-level: installs ALL dependencies (backend + frontend + mcp + tests)
-# For component-specific installs, see backend/requirements.txt, frontend/requirements.txt, mcp_server/requirements.txt
+# PharmaPulse - R&D Portfolio Valuation Platform
+# Core requirements
 
 # Backend
-fastapi>=0.110
-uvicorn[standard]>=0.29
-sqlalchemy>=2.0
-pydantic>=2.0
-openpyxl>=3.1
-numpy>=1.26
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+pydantic==2.10.4
+python-multipart==0.0.18
 
 # Frontend
-streamlit>=1.32
-requests>=2.31
-plotly>=5.18
-pandas>=2.1
+streamlit==1.41.1
+plotly==5.24.1
+pandas==2.2.3
+numpy==1.26.4
+
+# NPV Engines
+scipy==1.14.1
+
+# Export
+openpyxl==3.1.5
+
+# LLM Integration
+anthropic==0.42.0
+httpx==0.28.1
 
 # MCP Server
-mcp[cli]>=1.0
-httpx>=0.27
+mcp==1.2.0
 
-# Tests
-pytest>=8.0
+# Development & Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
