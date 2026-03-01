@@ -7,20 +7,11 @@ Provides tools for analyzing therapeutic area (TA) level budget shifts:
   - Optimal Mix:       Rank TAs by efficiency (NPV per EUR mm R&D cost)
 """
 
-from functools import reduce
-import operator
-
 from sqlalchemy.orm import Session
 
 from ..models import Portfolio, PortfolioProject, Snapshot, Cashflow
 from .. import crud
-
-
-def _compute_pts(snapshot) -> float:
-    """Compute overall PTS as product of all phase success rates."""
-    if not snapshot.phase_inputs:
-        return 0.0
-    return reduce(operator.mul, (pi.success_rate for pi in snapshot.phase_inputs), 1.0)
+from .risk_adjustment import compute_pts
 
 
 # ---------------------------------------------------------------------------
@@ -64,13 +55,13 @@ def get_ta_summary(portfolio_id: int, db: Session) -> dict:
             npv = snapshot.npv_deterministic or 0.0
             entry["total_npv"] += npv
 
-            rd_total = sum(abs(rc.rd_cost) for rc in snapshot.rd_costs)
+            rd_total = sum(abs(rc.rd_cost) for rc in snapshot.rd_costs if rc.year >= snapshot.valuation_year)
             entry["total_rd_cost"] += rd_total
 
             phase_num = phase_order.get(asset.current_phase, 0)
             entry["phases"].append(phase_num)
 
-            pts = _compute_pts(snapshot)
+            pts = compute_pts(snapshot.phase_inputs, asset.current_phase)
             if pts > 0:
                 entry["pts_values"].append(pts)
 
@@ -160,6 +151,9 @@ def analyze_budget_shift(
 
     net_npv_delta = npv_gained - npv_lost
 
+    # Collect project names in source TA for transparency
+    source_projects = source_data.get("project_names", [])
+
     new_source_cost = source_cost - shift_amount_eur_mm
     new_source_npv = source_npv - npv_lost
     new_target_cost = target_data["total_rd_cost"] + shift_amount_eur_mm
@@ -201,6 +195,12 @@ def analyze_budget_shift(
                 summary["portfolio_total_npv"] + net_npv_delta, 2
             ),
         },
+        "limitations": [
+            "NPV impact assumes linear relationship between budget and NPV within each TA.",
+            "Marginal efficiency is estimated at 70% of average efficiency for the target TA.",
+            "Does not model project-level granularity of budget cuts.",
+        ],
+        "projects_in_source_ta": source_projects,
         "recommendation": _budget_shift_recommendation(
             source_data["therapeutic_area"],
             target_data["therapeutic_area"],

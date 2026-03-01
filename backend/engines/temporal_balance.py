@@ -93,6 +93,8 @@ def analyze_revenue_gaps(portfolio_id: int, db: Session) -> dict:
     )
 
     for proj in portfolio.projects:
+        if not proj.is_active:
+            continue
         if not proj.snapshot:
             continue
 
@@ -205,6 +207,8 @@ def get_temporal_heatmap(portfolio_id: int, db: Session) -> dict:
     project_data: list[dict] = []
 
     for proj in portfolio.projects:
+        if not proj.is_active:
+            continue
         if not proj.snapshot:
             continue
 
@@ -220,6 +224,8 @@ def get_temporal_heatmap(portfolio_id: int, db: Session) -> dict:
 
         year_values: dict[int, float] = {}
         for cf in cashflows:
+            # Costs are stored as negative in the cashflow table (see deterministic.py),
+            # so abs() makes them positive before subtracting from revenue.
             net = (cf.revenue or 0) - abs(cf.costs or 0)
             year_values[cf.year] = round(net, 2)
             all_years.add(cf.year)

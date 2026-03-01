@@ -542,9 +542,10 @@ class PortfolioScenarioOverride(Base):
     __tablename__ = "portfolio_scenario_overrides"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    portfolio_project_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("portfolio_projects.id", ondelete="CASCADE"), nullable=False
+    portfolio_project_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("portfolio_projects.id", ondelete="CASCADE"), nullable=True
     )
+    reference_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     override_type: Mapped[str] = mapped_column(Text, nullable=False)
     phase_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     override_value: Mapped[float] = mapped_column(Float, nullable=False)
@@ -553,7 +554,7 @@ class PortfolioScenarioOverride(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Relationship
-    portfolio_project: Mapped["PortfolioProject"] = relationship(
+    portfolio_project: Mapped[Optional["PortfolioProject"]] = relationship(
         "PortfolioProject", back_populates="overrides"
     )
 

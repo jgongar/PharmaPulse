@@ -30,6 +30,7 @@ Override types and their effects:
 
 import json
 import math
+import uuid
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -40,6 +41,110 @@ from ..models import (
     Asset, Snapshot, Cashflow,
 )
 from .. import crud
+from .deterministic import calculate_deterministic_npv
+
+
+def simulate_override_npv(
+    snapshot: "Snapshot",
+    db: Session,
+    *,
+    peak_sales_pct_change: float | None = None,
+    sr_override_phase: str | None = None,
+    sr_override_value: float | None = None,
+    phase_delay_months: float | None = None,
+    launch_delay_months: float | None = None,
+    time_to_peak_change_years: float | None = None,
+    duration_shift: dict | None = None,
+    rd_cost_multiplier: float | None = None,
+) -> float:
+    """
+    Compute exact NPV by cloning a snapshot, applying modifications,
+    and running the deterministic engine on the clone.
+
+    Returns the computed NPV. Temp snapshot is deleted in finally block.
+    """
+    asset = db.query(Asset).filter(Asset.id == snapshot.asset_id).first()
+
+    # Clean up any stale temp snapshots for this asset
+    from ..models import Snapshot as SnapshotModel
+    db.query(SnapshotModel).filter(
+        SnapshotModel.asset_id == snapshot.asset_id,
+        SnapshotModel.snapshot_name.like("__temp_%"),
+    ).delete(synchronize_session="fetch")
+    db.flush()
+
+    temp_name = f"__temp_{uuid.uuid4().hex[:8]}__"
+    temp_snapshot = crud.clone_snapshot(
+        db, snapshot.asset_id, snapshot.id, temp_name
+    )
+    if not temp_snapshot:
+        return snapshot.npv_deterministic or 0.0
+
+    try:
+        # Apply peak_sales_change: scale peak_sales on all commercial rows
+        if peak_sales_pct_change is not None:
+            multiplier = 1.0 + (peak_sales_pct_change / 100.0)
+            for cr in temp_snapshot.commercial_rows:
+                cr.peak_sales = (cr.peak_sales or 0) * multiplier
+
+        # Apply SR override for a specific phase
+        if sr_override_phase and sr_override_value is not None:
+            for pi in temp_snapshot.phase_inputs:
+                if pi.phase_name == sr_override_phase:
+                    pi.success_rate = sr_override_value
+
+        # Apply phase delay (shift all phase start dates and approval date)
+        if phase_delay_months is not None:
+            shift_years = phase_delay_months / 12.0
+            for pi in temp_snapshot.phase_inputs:
+                pi.start_date = pi.start_date + shift_years
+            temp_snapshot.approval_date = (temp_snapshot.approval_date or 0) + shift_years
+            for cr in temp_snapshot.commercial_rows:
+                cr.launch_date = (cr.launch_date or 0) + shift_years
+
+        # Apply launch delay (shift only commercial launch dates)
+        if launch_delay_months is not None:
+            shift_years = launch_delay_months / 12.0
+            for cr in temp_snapshot.commercial_rows:
+                cr.launch_date = (cr.launch_date or 0) + shift_years
+
+        # Apply time_to_peak change
+        if time_to_peak_change_years is not None:
+            for cr in temp_snapshot.commercial_rows:
+                cr.time_to_peak = max(0.5, (cr.time_to_peak or 3) + time_to_peak_change_years)
+
+        # Apply duration shift (for acceleration — shift specific phase start dates)
+        if duration_shift:
+            # Use WhatIfPhaseLever mechanism: set lever_duration_months
+            from ..models import WhatIfPhaseLever
+            for phase_name, months in duration_shift.items():
+                db.add(WhatIfPhaseLever(
+                    snapshot_id=temp_snapshot.id,
+                    phase_name=phase_name,
+                    lever_duration_months=months,
+                    lever_sr=None,
+                ))
+
+        # Apply R&D cost multiplier
+        if rd_cost_multiplier is not None:
+            from ..models import RDCost
+            for rc in temp_snapshot.rd_costs:
+                rc.rd_cost = rc.rd_cost * rd_cost_multiplier
+
+        db.flush()
+
+        # Run deterministic engine on cloned snapshot
+        is_whatif = bool(duration_shift)
+        result = calculate_deterministic_npv(temp_snapshot.id, db, is_whatif=is_whatif)
+        return result["npv_deterministic"]
+
+    finally:
+        # Clean up temp snapshot (CASCADE deletes children)
+        from ..models import Snapshot as SnapshotModel
+        temp = db.query(SnapshotModel).filter(SnapshotModel.id == temp_snapshot.id).first()
+        if temp:
+            db.delete(temp)
+            db.flush()
 
 
 def simulate_portfolio(portfolio_id: int, db: Session) -> dict:
@@ -142,10 +247,17 @@ def simulate_portfolio(portfolio_id: int, db: Session) -> dict:
             "overrides_count": len(overrides_applied),
         })
     
+    # Determine valuation_year from first project's snapshot
+    _portfolio_valuation_year = 2025
+    for proj in portfolio.projects:
+        if proj.snapshot and proj.snapshot.valuation_year:
+            _portfolio_valuation_year = proj.snapshot.valuation_year
+            break
+
     # ---- Process added (hypothetical) projects ----
     added_results = []
     for ap in portfolio.added_projects:
-        ap_npv = _calculate_added_project_npv(ap)
+        ap_npv = _calculate_added_project_npv(ap, _portfolio_valuation_year, db)
         ap.npv_calculated = ap_npv
         total_npv += ap_npv
         
@@ -158,7 +270,7 @@ def simulate_portfolio(portfolio_id: int, db: Session) -> dict:
     # ---- Process BD placeholders ----
     bd_results = []
     for bd in portfolio.bd_placeholders:
-        bd_npv = _calculate_bd_placeholder_npv(bd)
+        bd_npv = _calculate_bd_placeholder_npv(bd, _portfolio_valuation_year, db)
         bd.npv_calculated = bd_npv
         total_npv += bd_npv
         
@@ -211,39 +323,54 @@ def restore_simulation_run(
     if not portfolio:
         raise ValueError(f"Portfolio {portfolio_id} not found")
     
-    # Clear current overrides
+    # Clear current overrides (both project-level and portfolio-level)
     for proj in portfolio.projects:
         db.query(PortfolioScenarioOverride).filter(
             PortfolioScenarioOverride.portfolio_project_id == proj.id
         ).delete()
         proj.is_active = True  # Reset all to active
-    
+    # Clear portfolio-level overrides (nullable portfolio_project_id)
+    db.query(PortfolioScenarioOverride).filter(
+        PortfolioScenarioOverride.portfolio_project_id.is_(None),
+    ).delete()
+
     # Restore deactivated flags
     deactivated = json.loads(run.deactivated_assets_json) if run.deactivated_assets_json else []
     for proj in portfolio.projects:
         if proj.asset_id in deactivated:
             proj.is_active = False
-    
+
     # Restore overrides
     overrides_data = json.loads(run.overrides_snapshot_json)
     for ov_data in overrides_data:
-        # Find the portfolio_project by asset_id
-        proj = (
-            db.query(PortfolioProject)
-            .filter(
-                PortfolioProject.portfolio_id == portfolio_id,
-                PortfolioProject.asset_id == ov_data.get("asset_id"),
-            )
-            .first()
-        )
-        if proj:
+        ov_type = ov_data["override_type"]
+        if ov_type in ("project_add", "bd_add"):
+            # Structural overrides are portfolio-level
             db.add(PortfolioScenarioOverride(
-                portfolio_project_id=proj.id,
-                override_type=ov_data["override_type"],
-                phase_name=ov_data.get("phase_name"),
+                portfolio_project_id=None,
+                reference_id=ov_data.get("reference_id"),
+                override_type=ov_type,
                 override_value=ov_data["override_value"],
                 description=ov_data.get("description"),
             ))
+        else:
+            # Find the portfolio_project by asset_id
+            proj = (
+                db.query(PortfolioProject)
+                .filter(
+                    PortfolioProject.portfolio_id == portfolio_id,
+                    PortfolioProject.asset_id == ov_data.get("asset_id"),
+                )
+                .first()
+            )
+            if proj:
+                db.add(PortfolioScenarioOverride(
+                    portfolio_project_id=proj.id,
+                    override_type=ov_type,
+                    phase_name=ov_data.get("phase_name"),
+                    override_value=ov_data["override_value"],
+                    description=ov_data.get("description"),
+                ))
     
     db.flush()
     
@@ -282,85 +409,53 @@ def apply_override(
         # Kill project — NPV drops to 0
         npv_after = 0.0
         is_active = False
-    
+
     elif otype == "peak_sales_change":
-        # ovalue is percentage change, e.g., +10 means multiply by 1.10
-        # Approximate NPV impact: revenue portion of NPV scales linearly
-        multiplier = 1.0 + (ovalue / 100.0)
-        # Rough approximation: assume ~70% of NPV is from commercial revenue
-        commercial_portion = npv_before * 0.7
-        rd_portion = npv_before * 0.3
-        npv_after = commercial_portion * multiplier + rd_portion
-    
+        # Use deterministic engine with modified peak sales
+        npv_after = simulate_override_npv(
+            snapshot, db, peak_sales_pct_change=ovalue
+        )
+
     elif otype == "sr_override":
-        # ovalue is new absolute success rate for a specific phase
-        # Impact: changes cumulative probability of success
-        phase_name = override.phase_name
-        if phase_name and snapshot.phase_inputs:
-            # Find original SR for this phase
-            original_sr = None
-            for pi in snapshot.phase_inputs:
-                if pi.phase_name == phase_name:
-                    original_sr = pi.success_rate
-                    break
-            if original_sr and original_sr > 0:
-                # Ratio of new/old SR affects the risk-adjusted portion
-                sr_ratio = ovalue / original_sr
-                npv_after = npv_before * sr_ratio
-    
+        # Use deterministic engine with modified success rate
+        npv_after = simulate_override_npv(
+            snapshot, db,
+            sr_override_phase=override.phase_name,
+            sr_override_value=ovalue,
+        )
+
     elif otype == "phase_delay":
-        # ovalue is months of delay
-        # Impact: time-value-of-money penalty
-        months_delay = ovalue
-        years_delay = months_delay / 12.0
-        wacc = snapshot.wacc_rd or 0.08
-        # Discount penalty for delay
-        discount_penalty = 1.0 / ((1 + wacc) ** years_delay)
-        npv_after = npv_before * discount_penalty
-    
+        # Use deterministic engine with shifted phase dates
+        npv_after = simulate_override_npv(
+            snapshot, db, phase_delay_months=ovalue
+        )
+
     elif otype == "launch_delay":
-        # ovalue is months of launch delay
-        months_delay = ovalue
-        years_delay = months_delay / 12.0
-        # Average commercial WACC
-        avg_wacc = 0.085
-        if snapshot.commercial_rows:
-            avg_wacc = sum(
-                cr.wacc_region for cr in snapshot.commercial_rows
-            ) / len(snapshot.commercial_rows)
-        discount_penalty = 1.0 / ((1 + avg_wacc) ** years_delay)
-        npv_after = npv_before * discount_penalty
-    
+        # Use deterministic engine with shifted launch dates
+        npv_after = simulate_override_npv(
+            snapshot, db, launch_delay_months=ovalue
+        )
+
     elif otype == "time_to_peak_change":
-        # ovalue is change in years to peak (positive = slower ramp)
-        # Approximate impact: ~5% NPV per year of slower ramp
-        npv_after = npv_before * (1.0 - 0.05 * ovalue)
-    
+        # Use deterministic engine with modified time_to_peak
+        npv_after = simulate_override_npv(
+            snapshot, db, time_to_peak_change_years=ovalue
+        )
+
     elif otype == "accelerate":
-        # ovalue = months of acceleration (negative means faster)
-        # Budget impact via acceleration_budget_multiplier
-        months_accel = abs(ovalue)
-        years_accel = months_accel / 12.0
-        wacc = snapshot.wacc_rd or 0.08
-        # Time-value benefit from earlier launch
-        time_benefit = (1 + wacc) ** years_accel
-        # Budget cost increase
-        budget_mult = override.acceleration_budget_multiplier or 1.0
-        # Net: benefit from earlier cash flows minus extra R&D cost
-        rd_fraction = 0.3  # Approximate R&D fraction of total NPV
-        commercial_benefit = (npv_before * (1 - rd_fraction)) * time_benefit
-        rd_cost_increase = abs(npv_before * rd_fraction) * budget_mult
-        npv_after = commercial_benefit - rd_cost_increase
-    
+        # Use deterministic engine with duration shift
+        phase_name = override.phase_name or "Phase 3"
+        npv_after = simulate_override_npv(
+            snapshot, db,
+            duration_shift={phase_name: -abs(ovalue)},
+        )
+
     elif otype == "budget_realloc":
-        # ovalue is multiplier for R&D cost of a specific phase
-        # Impact: changes R&D portion of NPV
-        rd_fraction = 0.3
-        rd_portion = abs(npv_before * rd_fraction)
-        commercial_portion = npv_before - (-rd_portion if npv_before > 0 else rd_portion)
-        new_rd_cost = rd_portion * ovalue
-        npv_after = commercial_portion - new_rd_cost
-    
+        # Use deterministic engine with R&D cost multiplier
+        npv_after = simulate_override_npv(
+            snapshot, db, rd_cost_multiplier=ovalue
+        )
+
     elif otype in ("project_add", "bd_add"):
         # These are structural — NPV contribution handled separately
         npv_after = npv_before  # No direct change to existing project
@@ -376,210 +471,237 @@ def apply_override(
 # HYPOTHETICAL PROJECT NPV
 # ---------------------------------------------------------------------------
 
-def _calculate_added_project_npv(ap: PortfolioAddedProject) -> float:
+def _calculate_added_project_npv(
+    ap: PortfolioAddedProject,
+    valuation_year: int = 2025,
+    db: Session = None,
+) -> float:
     """
-    Calculate NPV for a hypothetical added project using simplified model.
-    Uses peak_sales and standard revenue curve assumptions.
+    Calculate NPV for a hypothetical added project by creating a temporary
+    snapshot and running the deterministic engine for consistent valuation.
     """
-    valuation_year = 2025
-    horizon = 20
-    
+    if db is None:
+        return 0.0
+
+    from ..models import PhaseInput, RDCost, CommercialRow
+
     # Parse phases
     try:
         phases = json.loads(ap.phases_json)
     except (json.JSONDecodeError, TypeError):
         phases = []
-    
-    # Calculate cumulative success probability
-    cum_pos = 1.0
-    for phase in phases:
-        cum_pos *= phase.get("success_rate", 0.5)
-    
+
     # Parse R&D costs
     try:
         rd_costs = json.loads(ap.rd_costs_json)
     except (json.JSONDecodeError, TypeError):
         rd_costs = {}
-    
-    # Calculate R&D PV
-    rd_pv = 0.0
-    for year_str, cost in rd_costs.items():
-        year = int(year_str)
-        t = year - valuation_year
-        if t >= 0:
-            discount = (1 + ap.wacc_rd) ** t
-            rd_pv -= abs(cost) / discount
-    
-    # Calculate commercial PV
+
     launch_year = int(ap.launch_date)
     loe_year = int(ap.loe_year)
-    time_to_peak = ap.time_to_peak_years
-    peak_sales = ap.peak_sales
-    
-    commercial_pv = 0.0
-    for year in range(launch_year, min(loe_year + 5, valuation_year + horizon)):
-        t_since_launch = year - launch_year
-        t_from_valuation = year - valuation_year
-        
-        if t_from_valuation < 0:
-            continue
-        
-        # Revenue curve (logistic ramp)
-        if t_since_launch < 0:
-            revenue = 0
-        elif year > loe_year:
-            # Post-LOE erosion
-            years_post_loe = year - loe_year
-            erosion = max(
-                ap.erosion_floor_pct,
-                1.0 - ap.loe_cliff_rate * (years_post_loe / ap.years_to_erosion_floor)
-            )
-            revenue = peak_sales * erosion
-        else:
-            # Ramp-up
-            ramp = _logistic_ramp(t_since_launch, time_to_peak)
-            # Plateau
-            if t_since_launch >= time_to_peak + ap.plateau_years:
-                ramp = max(ramp, 1.0)
-            revenue = peak_sales * ramp
-        
-        # Costs
-        cogs = revenue * ap.cogs_rate
-        opex = revenue * ap.operating_cost_rate
-        net_revenue = revenue - cogs - opex
-        tax = net_revenue * ap.tax_rate if net_revenue > 0 else 0
-        fcf = net_revenue - tax
-        
-        # Risk adjust
-        fcf_ra = fcf * cum_pos
-        
-        # Discount
-        discount = (1 + ap.wacc_commercial) ** t_from_valuation
-        commercial_pv += fcf_ra / discount
-    
-    total_npv = rd_pv + commercial_pv
-    return round(total_npv, 2)
+
+    # Create temp asset
+    temp_asset = Asset(
+        compound_name=f"__temp_added_{ap.id}__",
+        therapeutic_area=ap.therapeutic_area or "Unknown",
+        current_phase=phases[0]["phase_name"] if phases else "Phase 1",
+        innovation_class="Standard",
+    )
+    db.add(temp_asset)
+    db.flush()
+
+    # Create temp snapshot
+    temp_snapshot = Snapshot(
+        asset_id=temp_asset.id,
+        snapshot_name=f"__temp_added_{uuid.uuid4().hex[:8]}__",
+        valuation_year=valuation_year,
+        horizon_years=max(20, loe_year - valuation_year + 5),
+        wacc_rd=ap.wacc_rd,
+        approval_date=float(launch_year),
+    )
+    db.add(temp_snapshot)
+    db.flush()
+
+    # Add phase inputs
+    for phase in phases:
+        db.add(PhaseInput(
+            snapshot_id=temp_snapshot.id,
+            phase_name=phase.get("phase_name", "Phase 1"),
+            start_date=phase.get("start_date", float(valuation_year)),
+            success_rate=phase.get("success_rate", 0.5),
+        ))
+
+    # Add R&D costs
+    for year_str, cost in rd_costs.items():
+        year = int(year_str)
+        db.add(RDCost(
+            snapshot_id=temp_snapshot.id,
+            year=year,
+            phase_name=phases[0]["phase_name"] if phases else "Phase 1",
+            rd_cost=-abs(cost),
+        ))
+
+    # Add commercial row
+    db.add(CommercialRow(
+        snapshot_id=temp_snapshot.id,
+        region="Global",
+        scenario="Base",
+        scenario_probability=1.0,
+        segment="Primary",
+        peak_sales=ap.peak_sales,
+        launch_date=float(launch_year),
+        time_to_peak=ap.time_to_peak_years,
+        plateau_years=ap.plateau_years,
+        loe_year=float(loe_year),
+        loe_cliff_rate=ap.loe_cliff_rate,
+        erosion_floor_pct=ap.erosion_floor_pct,
+        years_to_erosion_floor=ap.years_to_erosion_floor,
+        revenue_curve_type="logistic",
+        cogs_rate=ap.cogs_rate,
+        distribution_rate=0.0,
+        operating_cost_rate=ap.operating_cost_rate,
+        tax_rate=ap.tax_rate,
+        wacc_region=ap.wacc_commercial,
+        include_flag=1,
+    ))
+
+    db.flush()
+
+    try:
+        result = calculate_deterministic_npv(temp_snapshot.id, db)
+        return result["npv_deterministic"]
+    finally:
+        db.delete(temp_asset)
+        db.flush()
 
 
 # ---------------------------------------------------------------------------
 # BD PLACEHOLDER NPV
 # ---------------------------------------------------------------------------
 
-def _calculate_bd_placeholder_npv(bd: PortfolioBDPlaceholder) -> float:
+def _calculate_bd_placeholder_npv(
+    bd: PortfolioBDPlaceholder,
+    valuation_year: int = 2025,
+    db: Session = None,
+) -> float:
     """
-    Calculate NPV for a BD placeholder asset.
-    Accounts for deal costs (upfront, milestones, royalties),
-    revenue/cost sharing, and PTRS.
+    Calculate NPV for a BD placeholder asset by creating a temporary
+    snapshot and running the deterministic engine for consistent valuation.
     """
-    valuation_year = 2025
-    horizon = 20
-    
-    ptrs = bd.ptrs_assumed
+    if db is None:
+        return 0.0
+
+    from ..models import PhaseInput, RDCost, CommercialRow
+
     launch_year = int(bd.launch_date)
     loe_year = int(bd.loe_year)
-    peak_sales = bd.peak_sales
-    time_to_peak = bd.time_to_peak_years
-    
-    # Upfront payment (immediate cost)
-    deal_costs_pv = -bd.upfront_payment
-    
-    # Milestone payments
+
+    # Create temp asset
+    temp_asset = Asset(
+        compound_name=f"__temp_bd_{bd.id}__",
+        therapeutic_area=bd.therapeutic_area or "BD",
+        current_phase="Registration",
+        innovation_class="Standard",
+    )
+    db.add(temp_asset)
+    db.flush()
+
+    # Create temp snapshot
+    temp_snapshot = Snapshot(
+        asset_id=temp_asset.id,
+        snapshot_name=f"__temp_bd_{uuid.uuid4().hex[:8]}__",
+        valuation_year=valuation_year,
+        horizon_years=max(20, loe_year - valuation_year + 5),
+        wacc_rd=bd.wacc_rd,
+        approval_date=float(launch_year),
+    )
+    db.add(temp_snapshot)
+    db.flush()
+
+    # Add phase input with PTRS as success rate
+    db.add(PhaseInput(
+        snapshot_id=temp_snapshot.id,
+        phase_name="Registration",
+        start_date=float(valuation_year),
+        success_rate=bd.ptrs_assumed,
+    ))
+
+    # Add upfront payment as R&D cost
+    if bd.upfront_payment > 0:
+        db.add(RDCost(
+            snapshot_id=temp_snapshot.id,
+            year=valuation_year,
+            phase_name="Registration",
+            rd_cost=-bd.upfront_payment,
+        ))
+
+    # Add milestone payments as R&D costs
     try:
         milestones = json.loads(bd.milestone_payments_json) if bd.milestone_payments_json else {}
     except (json.JSONDecodeError, TypeError):
         milestones = {}
-    
     for year_str, payment in milestones.items():
-        year = int(year_str)
-        t = year - valuation_year
-        if t >= 0:
-            discount = (1 + bd.wacc_rd) ** t
-            deal_costs_pv -= abs(payment) / discount
-    
-    # R&D costs remaining
-    rd_pv = 0.0
+        db.add(RDCost(
+            snapshot_id=temp_snapshot.id,
+            year=int(year_str),
+            phase_name="Registration",
+            rd_cost=-abs(payment),
+        ))
+
+    # Add remaining R&D costs (with cost share)
     try:
         rd_costs = json.loads(bd.rd_cost_remaining_json) if bd.rd_cost_remaining_json else {}
     except (json.JSONDecodeError, TypeError):
         rd_costs = {}
-    
     for year_str, cost in rd_costs.items():
-        year = int(year_str)
-        t = year - valuation_year
-        if t >= 0:
-            discount = (1 + bd.wacc_rd) ** t
-            rd_pv -= abs(cost) * bd.cost_share_pct / discount
-    
-    # Commercial revenue
-    commercial_pv = 0.0
-    for year in range(launch_year, min(loe_year + 5, valuation_year + horizon)):
-        t_since_launch = year - launch_year
-        t_from_valuation = year - valuation_year
-        
-        if t_from_valuation < 0:
-            continue
-        
-        # Revenue curve
-        if t_since_launch < 0:
-            revenue = 0
-        elif year > loe_year:
-            years_post_loe = year - loe_year
-            erosion = max(
-                bd.erosion_floor_pct,
-                1.0 - bd.loe_cliff_rate * (years_post_loe / bd.years_to_erosion_floor)
-            )
-            revenue = peak_sales * erosion
-        else:
-            ramp = _logistic_ramp(t_since_launch, time_to_peak)
-            revenue = peak_sales * ramp
-        
-        # Apply revenue share
-        revenue *= bd.revenue_share_pct
-        
-        # Deduct royalty
-        royalty = revenue * bd.royalty_rate
-        net_after_royalty = revenue - royalty
-        
-        # Costs
-        cogs = net_after_royalty * bd.cogs_rate
-        opex = net_after_royalty * bd.operating_cost_rate
-        net_income = net_after_royalty - cogs - opex
-        tax = net_income * bd.tax_rate if net_income > 0 else 0
-        fcf = net_income - tax
-        
-        # Risk adjust with PTRS
-        fcf_ra = fcf * ptrs
-        
-        # Discount
-        discount = (1 + bd.wacc_commercial) ** t_from_valuation
-        commercial_pv += fcf_ra / discount
-    
-    total_npv = deal_costs_pv + rd_pv + commercial_pv
-    
-    # Store total deal cost for reporting
-    bd.total_deal_cost = abs(deal_costs_pv)
-    
-    return round(total_npv, 2)
+        db.add(RDCost(
+            snapshot_id=temp_snapshot.id,
+            year=int(year_str),
+            phase_name="Registration",
+            rd_cost=-abs(cost) * bd.cost_share_pct,
+        ))
+
+    # Effective peak sales after revenue share and royalty
+    effective_peak = bd.peak_sales * bd.revenue_share_pct * (1.0 - bd.royalty_rate)
+
+    # Add commercial row
+    db.add(CommercialRow(
+        snapshot_id=temp_snapshot.id,
+        region="Global",
+        scenario="Base",
+        scenario_probability=1.0,
+        segment="Primary",
+        peak_sales=effective_peak,
+        launch_date=float(launch_year),
+        time_to_peak=bd.time_to_peak_years,
+        plateau_years=float(max(1, loe_year - launch_year - int(bd.time_to_peak_years) - 2)),
+        loe_year=float(loe_year),
+        loe_cliff_rate=bd.loe_cliff_rate,
+        erosion_floor_pct=bd.erosion_floor_pct,
+        years_to_erosion_floor=bd.years_to_erosion_floor,
+        revenue_curve_type="logistic",
+        cogs_rate=bd.cogs_rate,
+        distribution_rate=0.0,
+        operating_cost_rate=bd.operating_cost_rate,
+        tax_rate=bd.tax_rate,
+        wacc_region=bd.wacc_commercial,
+        include_flag=1,
+    ))
+
+    db.flush()
+
+    try:
+        result = calculate_deterministic_npv(temp_snapshot.id, db)
+        bd.total_deal_cost = bd.upfront_payment + sum(abs(v) for v in milestones.values())
+        return result["npv_deterministic"]
+    finally:
+        db.delete(temp_asset)
+        db.flush()
 
 
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
-
-def _logistic_ramp(t: float, time_to_peak: float, k: float = 5.5) -> float:
-    """
-    Logistic revenue ramp-up function.
-    Returns a value between 0 and 1 representing fraction of peak sales.
-    """
-    if time_to_peak <= 0:
-        return 1.0
-    midpoint = time_to_peak * 0.5
-    exponent = -k * (t - midpoint) / time_to_peak
-    try:
-        return 1.0 / (1.0 + math.exp(exponent))
-    except OverflowError:
-        return 0.0 if exponent > 0 else 1.0
-
 
 def _get_cashflow_aggregates(
     snapshot_id: int, db: Session, is_active: bool

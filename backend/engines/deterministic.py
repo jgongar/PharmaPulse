@@ -135,6 +135,18 @@ def calculate_deterministic_npv(
         "effective_approval_date", snapshot.approval_date
     )
 
+    # Cascade duration shifts to R&D cost years
+    if duration_shifts:
+        total_shift_years = phase_timeline.get("total_shift_years", 0)
+        phase_shifts = phase_timeline.get("phases", {})
+        for cost in rd_costs:
+            # Shift costs for phases that were delayed
+            if cost.phase_name in phase_shifts:
+                phase_info = phase_shifts[cost.phase_name]
+                phase_shift = phase_info["shifted_start"] - phase_info["original_start"]
+                if phase_shift != 0:
+                    cost.year = cost.year + round(phase_shift)
+
     # ------------------------------------------------------------------
     # 4. Compute risk adjustment multipliers
     # ------------------------------------------------------------------
@@ -152,7 +164,7 @@ def calculate_deterministic_npv(
 
     rd_cashflows = []
     npv_rd = 0.0
-    current_phase_idx = PHASE_ORDER.index(asset.current_phase) if asset.current_phase in PHASE_ORDER else 0
+    current_phase_idx = PHASE_ORDER.index(asset.current_phase) if asset.current_phase and asset.current_phase in PHASE_ORDER else 0
 
     for cost in rd_costs:
         # Skip sunk costs (before valuation year)
@@ -198,6 +210,17 @@ def calculate_deterministic_npv(
     for row in commercial_rows:
         key = (row.region, row.scenario)
         region_scenario_groups[key].append(row)
+
+    # Validate scenario probabilities sum to ~1.0 per region
+    region_prob_sums = defaultdict(float)
+    for (region, scenario), rows in region_scenario_groups.items():
+        region_prob_sums[region] += rows[0].scenario_probability
+    for region, prob_sum in region_prob_sums.items():
+        if abs(prob_sum - 1.0) > 0.01:
+            raise ValueError(
+                f"Scenario probabilities for region '{region}' sum to {prob_sum:.4f}, "
+                f"expected ~1.0"
+            )
 
     commercial_cashflows = []
     npv_by_region_scenario = defaultdict(lambda: defaultdict(float))
@@ -247,8 +270,8 @@ def calculate_deterministic_npv(
                     erosion_floor_pct=row.erosion_floor_pct,
                     years_to_erosion_floor=row.years_to_erosion_floor,
                     revenue_curve_type=row.revenue_curve_type,
-                    logistic_k=row.logistic_k or 5.5,
-                    logistic_midpoint=row.logistic_midpoint or 0.5,
+                    logistic_k=row.logistic_k if row.logistic_k is not None else 5.5,
+                    logistic_midpoint=row.logistic_midpoint if row.logistic_midpoint is not None else 0.5,
                     year=year,
                 )
                 year_revenue += seg_revenue
@@ -259,7 +282,9 @@ def calculate_deterministic_npv(
             # Apply revenue lever (what-if)
             year_revenue *= revenue_lever
 
-            # Compute costs and FCF (use first row's rates as representative)
+            # Known limitation: cost rates (COGS, distribution, operating) are taken
+            # from the first row in this region-scenario group. When multiple segments
+            # exist with different cost structures, this is an approximation.
             rep_row = rows[0]
             cogs = year_revenue * rep_row.cogs_rate
             distribution = year_revenue * rep_row.distribution_rate

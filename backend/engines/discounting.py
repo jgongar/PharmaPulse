@@ -41,8 +41,10 @@ def discount_cashflow(
     exponent = (year - valuation_year) - 0.5
 
     if exponent < 0:
-        # Cashflow in or before valuation year — no discounting needed
-        # (but still apply mid-year for partial year)
+        # Negative exponent (cashflow in or before valuation year) causes
+        # the divisor (1+WACC)^exponent to be < 1, which inflates the PV.
+        # This correctly reflects that cashflows at the valuation midpoint
+        # are worth slightly more than face value when discounted to year-start.
         pass
 
     discount_factor = (1 + wacc) ** exponent

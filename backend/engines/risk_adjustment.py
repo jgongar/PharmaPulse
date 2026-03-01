@@ -14,10 +14,13 @@ Rules from Spec Section 5.6:
 Phase order: Phase 1 → Phase 2 → Phase 2 B → Phase 3 → Registration
 """
 
+import logging
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 # Canonical phase order (fixed)
-PHASE_ORDER = ["Phase 1", "Phase 2", "Phase 2 B", "Phase 3", "Registration"]
+PHASE_ORDER = ["Phase 1", "Phase 2", "Phase 2 B", "Phase 3", "Registration", "Approved"]
 
 
 def get_phase_index(phase_name: str) -> int:
@@ -54,6 +57,9 @@ def compute_cumulative_pos(
             - 'commercial_multiplier': float (product of ALL phase SRs)
             - 'cumulative_pos': float (same as commercial_multiplier)
     """
+    # Handle None current_phase — treat as "Phase 1" (most conservative)
+    if current_phase is None:
+        current_phase = "Phase 1"
     current_idx = get_phase_index(current_phase)
 
     # Build SR map from inputs
@@ -69,6 +75,15 @@ def compute_cumulative_pos(
         for phase_name, new_sr in sr_overrides.items():
             if new_sr is not None:
                 sr_map[phase_name] = new_sr
+
+    # Warn if expected phases from current_phase onward are missing
+    for i, phase_name in enumerate(PHASE_ORDER):
+        if i >= current_idx and phase_name not in sr_map and phase_name != "Approved":
+            logger.warning(
+                "Phase '%s' (index %d) missing from phase_inputs; "
+                "it will not contribute to cumulative POS",
+                phase_name, i,
+            )
 
     # Force SR = 1.0 for phases before current_phase (already succeeded)
     for i, phase_name in enumerate(PHASE_ORDER):
@@ -100,6 +115,14 @@ def compute_cumulative_pos(
     result["cumulative_pos"] = cumulative
 
     return result
+
+
+def compute_pts(phase_inputs, current_phase: str) -> float:
+    """Shared PTS: product of SRs respecting current_phase."""
+    if not phase_inputs:
+        return 0.0
+    result = compute_cumulative_pos(phase_inputs, current_phase or "Phase 1")
+    return result.get("cumulative_pos", 0.0)
 
 
 def get_phase_cost_multiplier(pos_result: dict, phase_name: str) -> float:

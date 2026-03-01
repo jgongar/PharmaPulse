@@ -8,13 +8,11 @@ Provides strategic portfolio visualization and scoring:
   - Efficient Frontier:   Pareto-optimal projects on the risk-return plane
 """
 
-from functools import reduce
-import operator
-
 from sqlalchemy.orm import Session
 
 from ..models import Portfolio
 from .. import crud
+from .risk_adjustment import compute_pts
 
 
 # Default charter targets
@@ -24,13 +22,6 @@ DEFAULT_CHARTER = {
     "max_single_project_weight_pct": 30,
     "min_phase_diversity": 3,
 }
-
-
-def _compute_pts(snapshot) -> float:
-    """Compute overall PTS as product of all phase success rates."""
-    if not snapshot or not snapshot.phase_inputs:
-        return 0.0
-    return reduce(operator.mul, (pi.success_rate for pi in snapshot.phase_inputs), 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +40,13 @@ def get_risk_return_scatter(portfolio_id: int, db: Session) -> dict:
         snapshot = proj.snapshot
 
         npv = (snapshot.npv_deterministic or 0) if snapshot else 0
-        pts = _compute_pts(snapshot)
+        pts = compute_pts(snapshot.phase_inputs if snapshot else [], asset.current_phase)
         peak_sales = asset.peak_sales_estimate or 0
         rd_cost = sum(abs(rc.rd_cost) for rc in snapshot.rd_costs) if snapshot else 0
 
         risk = 1.0 - pts
-        risk_adjusted_npv = npv * pts
+        # NPV from deterministic engine is already risk-adjusted
+        risk_adjusted_npv = npv
 
         projects.append({
             "asset_id": asset.id,
@@ -85,13 +77,13 @@ def get_risk_return_scatter(portfolio_id: int, db: Session) -> dict:
 
 def _get_quadrant(npv: float, risk: float) -> str:
     if npv >= 0 and risk <= 0.5:
-        return "Star (High Return, Low Risk)"
+        return "Star"
     elif npv >= 0 and risk > 0.5:
-        return "Question Mark (High Return, High Risk)"
+        return "High Risk / High Return"
     elif npv < 0 and risk <= 0.5:
-        return "Cash Cow (Low Return, Low Risk)"
+        return "Low Return"
     else:
-        return "Dog (Low Return, High Risk)"
+        return "Dog"
 
 
 def _compute_efficient_frontier(projects: list[dict]) -> list[str]:
@@ -133,7 +125,7 @@ def compute_innovation_score(portfolio_id: int, db: Session) -> dict:
         phases.add(asset.current_phase)
         tas.add(asset.therapeutic_area)
 
-        pts = _compute_pts(snapshot)
+        pts = compute_pts(snapshot.phase_inputs if snapshot else [], asset.current_phase)
         if pts > 0:
             pts_values.append(pts)
 
@@ -249,7 +241,7 @@ def check_charter_compliance(
         snapshot = proj.snapshot
 
         npv = (snapshot.npv_deterministic or 0) if snapshot else 0
-        pts = _compute_pts(snapshot)
+        pts = compute_pts(snapshot.phase_inputs if snapshot else [], asset.current_phase)
 
         total_npv += npv
         weighted_pts_sum += npv * pts

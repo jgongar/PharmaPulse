@@ -8,20 +8,13 @@ Provides Business Development (BD) deal modeling and reinvestment analysis:
   - Portfolio BD Scan:    Find portfolio projects that could be replaced by BD targets
 """
 
-from functools import reduce
-import operator
+import uuid
 
 from sqlalchemy.orm import Session
 
 from ..models import Portfolio
 from .. import crud
-
-
-def _compute_pts(snapshot) -> float:
-    """Compute overall PTS as product of all phase success rates."""
-    if not snapshot or not snapshot.phase_inputs:
-        return 0.0
-    return reduce(operator.mul, (pi.success_rate for pi in snapshot.phase_inputs), 1.0)
+from .risk_adjustment import compute_pts
 
 
 # ---------------------------------------------------------------------------
@@ -39,41 +32,66 @@ def value_bd_deal(
     royalty_pct: float = 0.0,
     wacc: float = 0.10,
     pts: float = 0.5,
+    db: Session = None,
 ) -> dict:
-    """Value a BD deal (in-licensing or acquisition)."""
+    """
+    Value a BD deal (in-licensing or acquisition).
+
+    If a db session is provided, creates a temporary snapshot and uses the
+    deterministic engine for consistent valuation. Otherwise falls back to
+    the simplified inline model.
+    """
     share = market_share_pct / 100
     margin = margin_pct / 100
     royalty = royalty_pct / 100
 
+    total_cost = upfront_eur_mm + milestones_eur_mm
     annual_revenue = peak_sales_eur_mm * share * margin * (1 - royalty)
 
-    total_commercial_pv = 0.0
-    yearly_cashflows = []
+    # Use deterministic engine if db is available
+    if db is not None:
+        deal_npv, risk_adjusted_pv, yearly_cashflows = _value_bd_via_engine(
+            db=db,
+            peak_sales=peak_sales_eur_mm * share,
+            margin_pct=margin_pct,
+            royalty_pct=royalty_pct,
+            years_to_launch=years_to_launch,
+            commercial_duration_years=commercial_duration_years,
+            upfront_eur_mm=upfront_eur_mm,
+            milestones_eur_mm=milestones_eur_mm,
+            wacc=wacc,
+            pts=pts,
+        )
+        total_commercial_pv = risk_adjusted_pv / pts if pts > 0 else 0
+    else:
+        # Fallback: simplified inline model
+        total_commercial_pv = 0.0
+        yearly_cashflows = []
 
-    for y in range(1, commercial_duration_years + 1):
-        year_from_now = years_to_launch + y
+        for y in range(1, commercial_duration_years + 1):
+            year_from_now = years_to_launch + y
 
-        if y <= 2:
-            rev_factor = y / 3.0
-        elif y >= commercial_duration_years - 1:
-            rev_factor = (commercial_duration_years - y + 1) / 3.0
-        else:
-            rev_factor = 1.0
+            if y <= 2:
+                rev_factor = y / 3.0
+            elif y >= commercial_duration_years - 1:
+                rev_factor = (commercial_duration_years - y + 1) / 3.0
+            else:
+                rev_factor = 1.0
 
-        revenue = annual_revenue * max(rev_factor, 0)
-        pv = revenue / ((1 + wacc) ** year_from_now)
-        total_commercial_pv += pv
+            revenue = annual_revenue * max(rev_factor, 0)
+            pv = revenue / ((1 + wacc) ** year_from_now)
+            total_commercial_pv += pv
 
-        yearly_cashflows.append({
-            "year_from_launch": y,
-            "year_from_now": year_from_now,
-            "revenue_eur_mm": round(revenue, 2),
-            "pv_eur_mm": round(pv, 2),
-        })
+            yearly_cashflows.append({
+                "year_from_launch": y,
+                "year_from_now": year_from_now,
+                "revenue_eur_mm": round(revenue, 2),
+                "pv_eur_mm": round(pv, 2),
+            })
 
-    risk_adjusted_pv = total_commercial_pv * pts
-    total_cost = upfront_eur_mm + milestones_eur_mm
-    deal_npv = risk_adjusted_pv - total_cost
+        risk_adjusted_pv = total_commercial_pv * pts
+        deal_npv = risk_adjusted_pv - total_cost
+
     roi = (risk_adjusted_pv / total_cost - 1) * 100 if total_cost > 0 else 0
 
     return {
@@ -108,6 +126,114 @@ def value_bd_deal(
     }
 
 
+def _value_bd_via_engine(
+    db: Session,
+    peak_sales: float,
+    margin_pct: float,
+    royalty_pct: float,
+    years_to_launch: int,
+    commercial_duration_years: int,
+    upfront_eur_mm: float,
+    milestones_eur_mm: float,
+    wacc: float,
+    pts: float,
+) -> tuple[float, float, list]:
+    """
+    Create a temporary asset+snapshot, populate with BD deal parameters,
+    run deterministic engine, then clean up. Returns (deal_npv, risk_adj_pv, cashflows).
+    """
+    from ..models import Asset, Snapshot, PhaseInput, RDCost, CommercialRow
+    from .deterministic import calculate_deterministic_npv
+    from datetime import date
+
+    valuation_year = date.today().year
+    launch_year = valuation_year + years_to_launch
+    loe_year = launch_year + commercial_duration_years
+
+    # Create temp asset
+    temp_asset = Asset(
+        compound_name=f"__temp_bd_deal_{uuid.uuid4().hex[:8]}__",
+        therapeutic_area="BD",
+        current_phase="Registration",
+        innovation_class="Standard",
+    )
+    db.add(temp_asset)
+    db.flush()
+
+    # Create temp snapshot
+    temp_snapshot = Snapshot(
+        asset_id=temp_asset.id,
+        snapshot_name=f"__temp_bd_{uuid.uuid4().hex[:8]}__",
+        valuation_year=valuation_year,
+        horizon_years=years_to_launch + commercial_duration_years + 5,
+        wacc_rd=wacc,
+        approval_date=float(launch_year),
+    )
+    db.add(temp_snapshot)
+    db.flush()
+
+    # Add phase input for Registration with SR = pts
+    db.add(PhaseInput(
+        snapshot_id=temp_snapshot.id,
+        phase_name="Registration",
+        start_date=float(valuation_year),
+        success_rate=pts,
+    ))
+
+    # Add upfront as R&D cost in valuation year
+    if upfront_eur_mm > 0:
+        db.add(RDCost(
+            snapshot_id=temp_snapshot.id,
+            year=valuation_year,
+            phase_name="Registration",
+            rd_cost=-upfront_eur_mm,
+        ))
+
+    # Add milestone as R&D cost spread at launch year
+    if milestones_eur_mm > 0:
+        db.add(RDCost(
+            snapshot_id=temp_snapshot.id,
+            year=launch_year,
+            phase_name="Registration",
+            rd_cost=-milestones_eur_mm,
+        ))
+
+    # Add commercial row
+    db.add(CommercialRow(
+        snapshot_id=temp_snapshot.id,
+        region="Global",
+        scenario="Base",
+        scenario_probability=1.0,
+        segment="Primary",
+        peak_sales=peak_sales,
+        launch_date=float(launch_year),
+        time_to_peak=3.0,
+        plateau_years=float(commercial_duration_years - 6),
+        loe_year=float(loe_year),
+        loe_cliff_rate=0.7,
+        erosion_floor_pct=0.1,
+        years_to_erosion_floor=3.0,
+        revenue_curve_type="logistic",
+        cogs_rate=(1.0 - margin_pct / 100.0) * 0.4,
+        distribution_rate=(1.0 - margin_pct / 100.0) * 0.3,
+        operating_cost_rate=(1.0 - margin_pct / 100.0) * 0.3,
+        tax_rate=0.21,
+        wacc_region=wacc,
+        include_flag=1,
+    ))
+
+    db.flush()
+
+    try:
+        result = calculate_deterministic_npv(temp_snapshot.id, db)
+        deal_npv = result["npv_deterministic"]
+        risk_adj_pv = result["npv_commercial"]
+        return deal_npv, abs(risk_adj_pv), []
+    finally:
+        db.delete(temp_asset)
+        db.flush()
+
+
 # ---------------------------------------------------------------------------
 # BD CUT & REINVEST
 # ---------------------------------------------------------------------------
@@ -136,7 +262,7 @@ def analyze_bd_cut_reinvest(
     cut_snapshot = cut_project.snapshot
 
     current_npv = (cut_snapshot.npv_deterministic or 0) if cut_snapshot else 0
-    current_pts = _compute_pts(cut_snapshot)
+    current_pts = compute_pts(cut_snapshot.phase_inputs if cut_snapshot else [], cut_asset.current_phase)
     current_rd_cost = (
         sum(abs(rc.rd_cost) for rc in cut_snapshot.rd_costs)
         if cut_snapshot else 0
@@ -221,7 +347,7 @@ def scan_bd_opportunities(
         snapshot = proj.snapshot
 
         npv = (snapshot.npv_deterministic or 0) if snapshot else 0
-        pts = _compute_pts(snapshot)
+        pts = compute_pts(snapshot.phase_inputs if snapshot else [], asset.current_phase)
         rd_cost = (
             sum(abs(rc.rd_cost) for rc in snapshot.rd_costs) if snapshot else 0
         )

@@ -558,6 +558,7 @@ def add_override(db: Session, data: OverrideCreate) -> PortfolioScenarioOverride
         phase_name=data.phase_name,
         override_value=data.override_value,
         acceleration_budget_multiplier=data.acceleration_budget_multiplier,
+        acceleration_timeline_reduction=data.acceleration_timeline_reduction,
         description=data.description,
     )
     db.add(override)
@@ -594,20 +595,14 @@ def add_hypothetical_project(
     db.add(added)
     db.flush()
 
-    # v5: Auto-create project_add override
-    # Link to the first project in the portfolio (as a reference point)
-    first_project = (
-        db.query(PortfolioProject)
-        .filter(PortfolioProject.portfolio_id == portfolio_id)
-        .first()
-    )
-    if first_project:
-        db.add(PortfolioScenarioOverride(
-            portfolio_project_id=first_project.id,
-            override_type="project_add",
-            override_value=float(added.id),
-            description=f"Added hypothetical project: {data.compound_name}",
-        ))
+    # v5: Auto-create project_add override (portfolio-level, no project anchor)
+    db.add(PortfolioScenarioOverride(
+        portfolio_project_id=None,
+        reference_id=added.id,
+        override_type="project_add",
+        override_value=float(added.id),
+        description=f"Added hypothetical project: {data.compound_name}",
+    ))
 
     db.commit()
     db.refresh(added)
@@ -628,19 +623,14 @@ def add_bd_placeholder(
     db.add(bd)
     db.flush()
 
-    # v5: Auto-create bd_add override
-    first_project = (
-        db.query(PortfolioProject)
-        .filter(PortfolioProject.portfolio_id == portfolio_id)
-        .first()
-    )
-    if first_project:
-        db.add(PortfolioScenarioOverride(
-            portfolio_project_id=first_project.id,
-            override_type="bd_add",
-            override_value=float(bd.id),
-            description=f"Added BD deal: {data.deal_name}",
-        ))
+    # v5: Auto-create bd_add override (portfolio-level, no project anchor)
+    db.add(PortfolioScenarioOverride(
+        portfolio_project_id=None,
+        reference_id=bd.id,
+        override_type="bd_add",
+        override_value=float(bd.id),
+        description=f"Added BD deal: {data.deal_name}",
+    ))
 
     db.commit()
     db.refresh(bd)

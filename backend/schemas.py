@@ -327,6 +327,7 @@ class OverrideCreate(BaseModel):
     phase_name: Optional[str] = None
     override_value: float
     acceleration_budget_multiplier: Optional[float] = None
+    acceleration_timeline_reduction: Optional[float] = None
     description: Optional[str] = None
 
     @field_validator("override_type")

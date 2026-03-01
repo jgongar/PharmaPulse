@@ -14,8 +14,6 @@ Acceleration Curve Model:
 
 import math
 from typing import Optional
-from functools import reduce
-import operator
 
 from sqlalchemy.orm import Session
 
@@ -24,6 +22,7 @@ from ..models import (
     PortfolioResult, Asset, Snapshot, Cashflow,
 )
 from .. import crud
+from .risk_adjustment import compute_pts
 
 
 # ---------------------------------------------------------------------------
@@ -33,17 +32,6 @@ from .. import crud
 ACCELERATION_ALPHA = 0.5        # Calibration constant for acceleration curve
 MAX_BUDGET_MULTIPLIER = 2.0     # Maximum budget multiplier
 MAX_TIMELINE_REDUCTION = 0.50   # Cap: no phase can be reduced by more than 50%
-
-
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
-def _compute_pts(snapshot: Snapshot) -> float:
-    """Compute overall PTS as product of all phase success rates."""
-    if not snapshot.phase_inputs:
-        return 0.0
-    return reduce(operator.mul, (pi.success_rate for pi in snapshot.phase_inputs), 1.0)
 
 
 def _compute_phase_duration_months(snapshot: Snapshot, phase_name: str) -> float:
@@ -271,12 +259,14 @@ def analyze_acceleration(
     additional_cost = (bm - 1.0) * phase_cost
     new_duration = original_duration - months_saved
 
-    # Estimate NPV gain from earlier commercialization
+    # Compute NPV gain by running deterministic engine with shifted dates
     original_npv = snapshot.npv_deterministic or 0.0
-    years_saved = months_saved / 12.0
-    wacc = snapshot.wacc_rd or 0.08
-    commercial_fraction = 0.7
-    npv_gain = original_npv * commercial_fraction * ((1 + wacc) ** years_saved - 1)
+    from .portfolio_sim import simulate_override_npv
+    new_npv = simulate_override_npv(
+        snapshot, db,
+        duration_shift={phase_name: -months_saved},
+    )
+    npv_gain = new_npv - original_npv
     net_npv_impact = npv_gain - additional_cost
 
     curve_data = generate_acceleration_curve_data(original_duration, phase_cost)
